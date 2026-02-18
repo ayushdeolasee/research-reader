@@ -4,11 +4,12 @@ set -euo pipefail
 # Research Reader macOS installer
 #
 # Default usage (latest release):
-#   curl -fsSL https://raw.githubusercontent.com/ayushdeolasee/research-reader/main/scripts/install-macos.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ayushdeolasee/research-reader/main/install.sh | bash
 #
 # Options:
 #   --repo owner/name    GitHub repository (default: ayushdeolasee/research-reader)
 #   --tag vX.Y.Z         Install a specific release tag
+#   --asset-url URL      Install directly from a .dmg/.app.tar.gz/.zip URL
 #   --no-launch          Do not launch the app after install
 #   --keep-quarantine    Keep macOS quarantine attribute on installed app
 #   -h, --help           Show help
@@ -16,6 +17,7 @@ set -euo pipefail
 DEFAULT_REPO="ayushdeolasee/research-reader"
 REPO="$DEFAULT_REPO"
 TAG=""
+ASSET_URL=""
 LAUNCH_AFTER_INSTALL=1
 STRIP_QUARANTINE=1
 
@@ -38,6 +40,7 @@ Usage:
 Options:
   --repo owner/name    GitHub repository (default: ayushdeolasee/research-reader)
   --tag vX.Y.Z         Install a specific release tag (default: latest release)
+  --asset-url URL      Direct app asset URL (.dmg, .app.tar.gz, .zip)
   --no-launch          Do not launch app after install
   --keep-quarantine    Keep quarantine attribute on installed app
   -h, --help           Show this help
@@ -58,6 +61,11 @@ while [[ $# -gt 0 ]]; do
     --tag)
       [[ $# -ge 2 ]] || error "--tag requires a value"
       TAG="$2"
+      shift 2
+      ;;
+    --asset-url)
+      [[ $# -ge 2 ]] || error "--asset-url requires a value"
+      ASSET_URL="$2"
       shift 2
       ;;
     --no-launch)
@@ -111,25 +119,42 @@ cleanup() {
 }
 trap cleanup EXIT
 
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-if [[ -n "$TAG" ]]; then
-  API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
-fi
-
-log "Fetching release metadata from ${REPO}..."
-
 CURL_HEADERS=(-H "Accept: application/vnd.github+json")
 if [[ -n "${GH_TOKEN:-}" ]]; then
   CURL_HEADERS+=(-H "Authorization: Bearer ${GH_TOKEN}")
 fi
 
 RELEASE_JSON="${TMP_DIR}/release.json"
-curl -fsSL "${CURL_HEADERS[@]}" "$API_URL" -o "$RELEASE_JSON" || {
-  error "Failed to fetch release metadata. Check repository/tag and access permissions."
-}
+ASSET_NAME=""
+if [[ -z "$ASSET_URL" ]]; then
+  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+  if [[ -n "$TAG" ]]; then
+    API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+  fi
 
-SELECTED_ASSET="$(
-  python3 - "$RELEASE_JSON" "$ARCH" <<'PY'
+  log "Fetching release metadata from ${REPO}..."
+
+  HTTP_STATUS="$(curl -sSL "${CURL_HEADERS[@]}" -o "$RELEASE_JSON" -w "%{http_code}" "$API_URL" || true)"
+  case "$HTTP_STATUS" in
+    200)
+      ;;
+    404)
+      if [[ -n "$TAG" ]]; then
+        error "Release tag '${TAG}' not found for ${REPO}."
+      else
+        error "No GitHub release found for ${REPO}. Create a release with a macOS asset, provide --asset-url, or set GH_TOKEN for private repos."
+      fi
+      ;;
+    401|403)
+      error "GitHub API request denied (HTTP ${HTTP_STATUS}). Set GH_TOKEN if repo is private or rate-limited."
+      ;;
+    *)
+      error "Failed to fetch release metadata (HTTP ${HTTP_STATUS})."
+      ;;
+  esac
+
+  SELECTED_ASSET="$(
+    python3 - "$RELEASE_JSON" "$ARCH" <<'PY'
 import json
 import pathlib
 import sys
@@ -210,12 +235,17 @@ print(f"{name}\t{url}")
 PY
 )"
 
-if [[ -z "$SELECTED_ASSET" ]]; then
-  error "No suitable macOS release asset found (.dmg, .app.tar.gz, or .zip)."
-fi
+  if [[ -z "$SELECTED_ASSET" ]]; then
+    error "No suitable macOS release asset found (.dmg, .app.tar.gz, or .zip)."
+  fi
 
-ASSET_NAME="${SELECTED_ASSET%%$'\t'*}"
-ASSET_URL="${SELECTED_ASSET#*$'\t'}"
+  ASSET_NAME="${SELECTED_ASSET%%$'\t'*}"
+  ASSET_URL="${SELECTED_ASSET#*$'\t'}"
+else
+  ASSET_NAME="$(basename "${ASSET_URL%%\?*}")"
+  [[ -n "$ASSET_NAME" ]] || ASSET_NAME="research-reader-macos-asset"
+  log "Using direct asset URL."
+fi
 
 ARCHIVE_PATH="${TMP_DIR}/${ASSET_NAME}"
 log "Downloading ${ASSET_NAME}..."
