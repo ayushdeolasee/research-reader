@@ -11,6 +11,7 @@ import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { usePdfStore } from "@/stores/pdf-store";
 import { useAnnotationStore } from "@/stores/annotation-store";
+import { useAiStore } from "@/stores/ai-store";
 import { HighlightLayer } from "@/components/annotations/HighlightLayer";
 import { SelectionPopover } from "@/components/annotations/SelectionPopover";
 import { useTextSelection } from "@/hooks/useTextSelection";
@@ -94,6 +95,9 @@ export function PdfViewer() {
   const annotations = useAnnotationStore((s) => s.annotations);
   const addNote = useAnnotationStore((s) => s.addNote);
   const selectAnnotation = useAnnotationStore((s) => s.selectAnnotation);
+  const setPageText = useAiStore((s) => s.setPageText);
+  const clearDocumentContext = useAiStore((s) => s.clearDocumentContext);
+  const textExtractionRunRef = useRef(0);
 
   // Page dimension tracking for virtualization placeholders.
   const [pageDimensions, setPageDimensions] = useState<
@@ -129,6 +133,7 @@ export function PdfViewer() {
         setPdfData(null);
         setPdfError(null);
         setPageDimensions({});
+        clearDocumentContext();
       });
       return;
     }
@@ -159,13 +164,44 @@ export function PdfViewer() {
     return () => {
       cancelled = true;
     };
-  }, [doc]);
+  }, [clearDocumentContext, doc]);
 
   const onDocumentLoadSuccess = useCallback(
-    ({ numPages: pages }: { numPages: number }) => {
+    (loadedPdf: { numPages: number; getPage: (page: number) => Promise<unknown> }) => {
+      const pages = loadedPdf.numPages;
       setNumPages(pages);
+
+      const runId = textExtractionRunRef.current + 1;
+      textExtractionRunRef.current = runId;
+
+      void (async () => {
+        for (let pageNum = 1; pageNum <= pages; pageNum++) {
+          if (textExtractionRunRef.current !== runId) return;
+          try {
+            const page = (await loadedPdf.getPage(pageNum)) as {
+              getTextContent: () => Promise<{
+                items: Array<{ str?: string }>;
+              }>;
+            };
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items
+              .map((item) => item.str ?? "")
+              .join(" ")
+              .replace(/\s+/g, " ")
+              .trim();
+            setPageText(pageNum, pageText);
+          } catch (err) {
+            console.warn(`[PdfViewer] Failed text extraction for page ${pageNum}:`, err);
+          }
+
+          // Yield periodically to keep UI responsive.
+          if (pageNum % 4 === 0) {
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+          }
+        }
+      })();
     },
-    [setNumPages],
+    [setNumPages, setPageText],
   );
 
   useEffect(() => {
@@ -250,6 +286,8 @@ export function PdfViewer() {
 
   // --- Scroll handler: RAF-throttled visibility tracking ---
   const ticking = useRef(false);
+  const scrollEventPendingRef = useRef(false);
+  const lastKnownScrollRef = useRef<{ top: number; left: number } | null>(null);
   const handleScroll = useCallback(() => {
     if (ticking.current) return;
     ticking.current = true;
@@ -258,8 +296,24 @@ export function PdfViewer() {
       if (zoomSettlingRef.current) return;
       const container = containerRef.current;
       if (!container) return;
+      const triggeredByScrollEvent = scrollEventPendingRef.current;
+      scrollEventPendingRef.current = false;
 
-      if (selection) {
+      const prevScroll = lastKnownScrollRef.current;
+      const scrollDeltaY = prevScroll
+        ? Math.abs(container.scrollTop - prevScroll.top)
+        : 0;
+      const scrollDeltaX = prevScroll
+        ? Math.abs(container.scrollLeft - prevScroll.left)
+        : 0;
+      const hasMeaningfulScroll = scrollDeltaY > 1 || scrollDeltaX > 1;
+
+      lastKnownScrollRef.current = {
+        top: container.scrollTop,
+        left: container.scrollLeft,
+      };
+
+      if (selection && triggeredByScrollEvent && hasMeaningfulScroll) {
         clearSelection();
       }
 
@@ -303,6 +357,11 @@ export function PdfViewer() {
     setCurrentPage,
     setVisiblePages,
   ]);
+
+  const handleContainerScroll = useCallback(() => {
+    scrollEventPendingRef.current = true;
+    handleScroll();
+  }, [handleScroll]);
 
   // Scroll to a specific page
   const scrollToPage = useCallback((pageNum: number) => {
@@ -839,7 +898,7 @@ export function PdfViewer() {
         "relative flex-1 overflow-auto bg-muted",
         mode === "note" && "cursor-crosshair",
       )}
-      onScroll={handleScroll}
+      onScroll={handleContainerScroll}
       onMouseUp={handleMouseUp}
       onClick={handleContainerClick}
     >

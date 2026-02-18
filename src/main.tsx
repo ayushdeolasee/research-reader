@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import App from "./App";
 import "./index.css";
+import "katex/dist/katex.min.css";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

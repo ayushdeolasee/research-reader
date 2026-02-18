@@ -2,30 +2,44 @@ import { useEffect, useCallback, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { usePdfStore } from "@/stores/pdf-store";
 import { useAnnotationStore } from "@/stores/annotation-store";
+import { useAiStore } from "@/stores/ai-store";
 import { PdfViewer } from "@/components/pdf/PdfViewer";
 import { Toolbar } from "@/components/pdf/Toolbar";
 import { AnnotationSidebar } from "@/components/annotations/AnnotationSidebar";
+import { AiPanel } from "@/components/ai/AiPanel";
 import { WelcomeScreen } from "@/components/WelcomeScreen";
 import * as commands from "@/lib/tauri-commands";
 import { confirmPdfImport } from "@/lib/pdf-import";
-import { PanelRightClose, PanelRightOpen } from "lucide-react";
+import { MessageSquare, PanelRightClose, PanelRightOpen, Sparkles } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 export default function App() {
   // Only subscribe to what drives rendering decisions
   const doc = usePdfStore((s) => s.document);
   const loadAnnotations = useAnnotationStore((s) => s.loadAnnotations);
   const clearAnnotations = useAnnotationStore((s) => s.clearAnnotations);
+  const clearDocumentContext = useAiStore((s) => s.clearDocumentContext);
+  const loadConversationForDocument = useAiStore((s) => s.loadConversationForDocument);
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarTab, setSidebarTab] = useState<"annotations" | "ai">("annotations");
 
   // Load annotations when document changes
   useEffect(() => {
     if (doc) {
       loadAnnotations();
+      loadConversationForDocument(doc);
     } else {
       clearAnnotations();
+      clearDocumentContext();
     }
-  }, [doc, loadAnnotations, clearAnnotations]);
+  }, [
+    doc,
+    loadAnnotations,
+    clearAnnotations,
+    clearDocumentContext,
+    loadConversationForDocument,
+  ]);
 
   // Auto-save every 30 seconds
   useEffect(() => {
@@ -141,8 +155,37 @@ export default function App() {
 
         {/* Annotation sidebar */}
         {sidebarOpen && (
-          <div className="w-72 flex-shrink-0 overflow-hidden border-l bg-background">
-            <AnnotationSidebar />
+          <div className="w-80 flex-shrink-0 overflow-hidden border-l bg-background">
+            <div className="flex border-b">
+              <button
+                className={cn(
+                  "flex flex-1 items-center justify-center gap-1.5 px-3 py-2 text-xs transition-colors",
+                  sidebarTab === "annotations"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+                onClick={() => setSidebarTab("annotations")}
+              >
+                <MessageSquare size={12} />
+                Annotations
+              </button>
+              <button
+                className={cn(
+                  "flex flex-1 items-center justify-center gap-1.5 px-3 py-2 text-xs transition-colors",
+                  sidebarTab === "ai"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+                onClick={() => setSidebarTab("ai")}
+              >
+                <Sparkles size={12} />
+                AI
+              </button>
+            </div>
+
+            <div className="h-[calc(100%-33px)] overflow-hidden">
+              {sidebarTab === "annotations" ? <AnnotationSidebar /> : <AiPanel />}
+            </div>
           </div>
         )}
       </div>

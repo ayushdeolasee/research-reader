@@ -154,16 +154,16 @@ All core functionality is implemented and working.
 4. Crash prevention: ErrorBoundary + try/catch around note creation + defensive guards
 5. Blank screen on load: `useCallback` was placed after early returns (hooks ordering violation)
 
-### Phase 2: AI Integration 🔜 NEXT
+### Phase 2: AI Integration ✅ COMPLETE
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | AI chat side panel with Vercel AI SDK + Gemini (BYOK) | ⬜ Not started |
-| 2 | Context system: full PDF text + current viewport focus + annotations | ⬜ Not started |
-| 3 | AI tools: addHighlight(), addNote(), goToPage() — calls store actions | ⬜ Not started |
-| 4 | Push-to-talk voice input (Web Speech API / Whisper) | ⬜ Not started |
-| 5 | TTS for AI responses | ⬜ Not started |
-| 6 | Settings: model selection, API keys, voice mode toggle | ⬜ Not started |
+| 1 | AI chat side panel with Vercel AI SDK + Gemini (BYOK) | ✅ Done |
+| 2 | Context system: full PDF text + current viewport focus + annotations | ✅ Done |
+| 3 | AI tools: addHighlight(), addNote(), goToPage() — calls store actions | ✅ Done |
+| 4 | Push-to-talk voice input (Web Speech API / Whisper) | ✅ Done |
+| 5 | TTS for AI responses | ✅ Done |
+| 6 | Settings: model selection, API keys, voice mode toggle | ✅ Done |
 
 **Design notes:**
 - AI shares the same store actions as UI (addHighlight, addNote, goToPage) — no separate code paths
@@ -188,6 +188,10 @@ All core functionality is implemented and working.
 | 3 | Multi-document library view | ⬜ Not started |
 | 4 | Export annotations (Markdown, annotated PDF copy) | ⬜ Not started |
 | 5 | iCloud/Dropbox sync of .rr files | ⬜ Not started |
+
+### Additionals
+
+- Add OCR for document extraction
 
 ---
 
