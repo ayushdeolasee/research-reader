@@ -171,13 +171,13 @@ All core functionality is implemented and working.
 - Context window: extract full PDF text + serialize visible page range + current annotations as structured context for the AI
 - AI tools are function-calling based — the AI SDK invokes store actions, results appear in the UI instantly via optimistic updates
 
-### Phase 3: Advanced Voice ⬜ FUTURE
+### Phase 3: Advanced Voice ✅ COMPLETE
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | Full conversation mode (Gemini Live / OpenAI Realtime API) | ⬜ Not started |
-| 2 | Streaming bidirectional audio | ⬜ Not started |
-| 3 | Settings toggle between push-to-talk and conversation mode | ⬜ Not started |
+| 1 | Full conversation mode (Gemini Live / OpenAI Realtime API) | ✅ Done |
+| 2 | Streaming bidirectional audio | ✅ Done |
+| 3 | Settings toggle between push-to-talk and conversation mode | ✅ Done |
 
 ### Phase 4: Platform Expansion ⬜ FUTURE
 

@@ -1,9 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAiStore } from "@/stores/ai-store";
-import { usePdfStore } from "@/stores/pdf-store";
-import { useAnnotationStore } from "@/stores/annotation-store";
-import { MarkdownMessage } from "@/components/ai/MarkdownMessage";
-import { cn } from "@/lib/utils";
+import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from "@google/genai";
 import {
   Bot,
   MessageSquare,
@@ -13,6 +9,12 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
+import { MarkdownMessage } from "@/components/ai/MarkdownMessage";
+import { useAiStore } from "@/stores/ai-store";
+import { buildLiveSessionPrompt } from "@/lib/ai-prompts";
+import { cn } from "@/lib/utils";
+import { usePdfStore } from "@/stores/pdf-store";
+import { useAnnotationStore } from "@/stores/annotation-store";
 
 type SpeechRecognitionLike = {
   continuous: boolean;
@@ -26,11 +28,14 @@ type SpeechRecognitionLike = {
 };
 
 const MODELS = [
+  "gemini-3.1-flash-lite",
   "gemini-3-pro-preview",
   "gemini-3-flash-preview",
   "gemini-2.5-pro",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
+  "gemini-live-2.5-flash-preview",
+  "gemini-2.0-flash-live-preview-04-09",
   "gemini-2.5-flash-preview-09-2025",
   "gemini-2.5-flash-lite-preview-09-2025",
   "gemini-2.0-flash",
@@ -40,15 +45,28 @@ const MODELS = [
 ];
 const SNAPSHOT_MAX_DIMENSION = 1280;
 const SNAPSHOT_JPEG_QUALITY = 0.72;
+const CONVERSATION_SEND_DEBOUNCE_MS = 900;
+const MAX_LIVE_CONTEXT_CHARS = 9_000;
+
+function resolveLiveModel(model: string): string {
+  if (model.includes("live")) return model;
+  return "gemini-live-2.5-flash-preview";
+}
 
 export function AiPanel() {
   const messages = useAiStore((s) => s.messages);
   const isThinking = useAiStore((s) => s.isThinking);
   const error = useAiStore((s) => s.error);
   const settings = useAiStore((s) => s.settings);
+  const pageTexts = useAiStore((s) => s.pageTexts);
   const setSettings = useAiStore((s) => s.setSettings);
   const clearConversation = useAiStore((s) => s.clearConversation);
   const sendMessage = useAiStore((s) => s.sendMessage);
+  const sendConversationMessage = useAiStore((s) => s.sendConversationMessage);
+  const addLocalMessage = useAiStore((s) => s.addLocalMessage);
+  const updateLocalMessage = useAiStore((s) => s.updateLocalMessage);
+  const setThinkingState = useAiStore((s) => s.setThinkingState);
+  const setErrorState = useAiStore((s) => s.setErrorState);
 
   const doc = usePdfStore((s) => s.document);
   const currentPage = usePdfStore((s) => s.currentPage);
@@ -59,10 +77,35 @@ export function AiPanel() {
   const [input, setInput] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const [isConversationActive, setIsConversationActive] = useState(false);
+  const [conversationInterimText, setConversationInterimText] = useState("");
+
+  const pushToTalkRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const conversationRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const liveSessionRef = useRef<Session | null>(null);
+  const connectLiveSessionRef = useRef<(() => Promise<boolean>) | null>(null);
+  const liveReplyMessageIdRef = useRef<string | null>(null);
+  const liveReplyBufferRef = useRef("");
+
   const listRef = useRef<HTMLDivElement>(null);
   const lastSpokenMessageIdRef = useRef<string | null>(null);
-  const isListeningRef = useRef(false);
+  const pushToTalkListeningRef = useRef(false);
+  const conversationListeningRef = useRef(false);
+  const conversationPendingTextRef = useRef("");
+  const conversationSendTimerRef = useRef<number | null>(null);
+  const shouldAutoRestartConversationRef = useRef(false);
+  const resumeConversationAfterReplyRef = useRef(false);
+  const isThinkingRef = useRef(false);
+  const isSpeakingRef = useRef(false);
+  const isConversationActiveRef = useRef(false);
+
+  useEffect(() => {
+    isThinkingRef.current = isThinking;
+  }, [isThinking]);
+
+  useEffect(() => {
+    isConversationActiveRef.current = isConversationActive;
+  }, [isConversationActive]);
 
   useEffect(() => {
     if (!listRef.current) return;
@@ -76,90 +119,59 @@ export function AiPanel() {
     return null;
   }, [messages]);
 
-  useEffect(() => {
-    if (!settings.ttsEnabled) return;
-    if (!latestAssistantMessage) return;
-    if (latestAssistantMessage.id === lastSpokenMessageIdRef.current) return;
-    if (!("speechSynthesis" in window)) return;
-
-    lastSpokenMessageIdRef.current = latestAssistantMessage.id;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(latestAssistantMessage.content);
-    utterance.rate = 1;
-    utterance.pitch = 1;
-    window.speechSynthesis.speak(utterance);
-  }, [latestAssistantMessage, settings.ttsEnabled]);
-
-  const createSpeechRecognition = useCallback(() => {
-    const ctor =
-      (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionLike })
-        .SpeechRecognition ??
-      (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionLike })
-        .webkitSpeechRecognition;
-    if (!ctor) return null;
-
-    const recognition = new ctor();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = "en-US";
-    recognition.onresult = (event) => {
-      const transcript = Array.from(event.results)
-        .map((result) => result[0]?.transcript ?? "")
-        .join(" ")
-        .trim();
-
-      if (transcript) {
-        setInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
-      }
-    };
-    recognition.onerror = () => {
-      isListeningRef.current = false;
-      setIsListening(false);
-    };
-    recognition.onend = () => {
-      isListeningRef.current = false;
-      setIsListening(false);
-    };
-    return recognition;
+  const clearConversationSendTimer = useCallback(() => {
+    if (conversationSendTimerRef.current !== null) {
+      window.clearTimeout(conversationSendTimerRef.current);
+      conversationSendTimerRef.current = null;
+    }
   }, []);
 
-  const handlePushToTalkStart = useCallback(() => {
-    if (settings.voiceMode !== "push-to-talk") return;
-    if (isListeningRef.current) return;
+  const getSpeechRecognitionCtor = useCallback(() => {
+    return (
+      (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionLike })
+        .SpeechRecognition ??
+      (window as unknown as {
+        webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+      }).webkitSpeechRecognition
+    );
+  }, []);
 
-    const recognition = recognitionRef.current ?? createSpeechRecognition();
-    if (!recognition) return;
-    recognitionRef.current = recognition;
-
-    try {
-      isListeningRef.current = true;
-      setIsListening(true);
-      recognition.start();
-    } catch {
-      isListeningRef.current = false;
-      setIsListening(false);
+  const stopConversationListening = useCallback((disableAutoRestart = false) => {
+    if (disableAutoRestart) {
+      shouldAutoRestartConversationRef.current = false;
     }
-  }, [createSpeechRecognition, settings.voiceMode]);
+    if (!conversationListeningRef.current) return;
 
-  const handlePushToTalkStop = useCallback(() => {
-    if (!isListeningRef.current) return;
-    isListeningRef.current = false;
+    conversationListeningRef.current = false;
     setIsListening(false);
+
     try {
-      recognitionRef.current?.stop();
+      conversationRecognitionRef.current?.stop();
     } catch {
       // Ignore recognition stop errors.
     }
   }, []);
 
-  useEffect(() => {
-    return () => {
-      handlePushToTalkStop();
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-      }
-    };
-  }, [handlePushToTalkStop]);
+  const startConversationListening = useCallback(() => {
+    if (settings.voiceMode !== "conversation") return;
+    if (!isConversationActiveRef.current) return;
+    if (!shouldAutoRestartConversationRef.current) return;
+    if (conversationListeningRef.current) return;
+    if (isThinkingRef.current || isSpeakingRef.current) return;
+    if (!liveSessionRef.current) return;
+
+    const recognition = conversationRecognitionRef.current;
+    if (!recognition) return;
+
+    try {
+      conversationListeningRef.current = true;
+      setIsListening(true);
+      recognition.start();
+    } catch {
+      conversationListeningRef.current = false;
+      setIsListening(false);
+    }
+  }, [settings.voiceMode]);
 
   const captureCurrentPageImage = useCallback(() => {
     const pageRoot = window.document.querySelector(
@@ -206,13 +218,10 @@ export function AiPanel() {
     }
   }, [currentPage]);
 
-  const handleSubmit = useCallback(
-    async (e?: React.FormEvent) => {
-      e?.preventDefault();
-      const trimmed = input.trim();
-      if (!trimmed || isThinking) return;
-
-      const currentPageImage = captureCurrentPageImage();
+  const sendWithContext = useCallback(
+    async (rawText: string, useConversationPath: boolean) => {
+      const trimmed = rawText.trim();
+      if (!trimmed || isThinkingRef.current) return;
 
       const context = {
         title: doc?.title ?? null,
@@ -220,22 +229,549 @@ export function AiPanel() {
         currentPage,
         visiblePages,
         annotations,
-        currentPageImage,
+        currentPageImage: captureCurrentPageImage(),
       };
 
-      setInput("");
-      await sendMessage(trimmed, context);
+      if (useConversationPath) {
+        await sendConversationMessage(trimmed, context);
+      } else {
+        await sendMessage(trimmed, context);
+      }
     },
     [
       annotations,
       captureCurrentPageImage,
       currentPage,
       doc?.title,
-      input,
-      isThinking,
       numPages,
+      sendConversationMessage,
       sendMessage,
       visiblePages,
+    ],
+  );
+
+  const buildLivePrompt = useCallback(
+    (rawText: string) => {
+      const visibleText = visiblePages
+        .map((page) => `[Page ${page}] ${pageTexts[page] ?? ""}`)
+        .join("\n");
+      const currentAnnotations = annotations
+        .filter((a) => a.page_number === currentPage)
+        .slice(-30)
+        .map((a) => {
+          const selected = a.position_data?.selected_text ?? "";
+          const note = a.content ?? "";
+          return `- (${a.type}) color=${a.color ?? "none"} text="${selected}" note="${note}"`;
+        })
+        .join("\n");
+
+      return buildLiveSessionPrompt({
+        documentTitle: doc?.title ?? "Untitled",
+        totalPages: numPages,
+        currentPage,
+        visiblePages: visiblePages.join(", ") || "none",
+        visiblePageText: visibleText || "(none)",
+        currentPageAnnotations: currentAnnotations || "(none)",
+        userMessage: rawText,
+      }).slice(0, MAX_LIVE_CONTEXT_CHARS);
+    },
+    [annotations, currentPage, doc?.title, numPages, pageTexts, visiblePages],
+  );
+
+  const connectLiveSession = useCallback(async () => {
+    const apiKey = settings.apiKey.trim();
+    if (!apiKey) {
+      setErrorState("Set your Gemini API key in AI settings.");
+      return false;
+    }
+
+    try {
+      liveSessionRef.current?.close();
+    } catch {
+      // Ignore close errors.
+    }
+    liveSessionRef.current = null;
+    liveReplyBufferRef.current = "";
+    liveReplyMessageIdRef.current = null;
+
+    try {
+      const ai = new GoogleGenAI({ apiKey });
+      const session = await ai.live.connect({
+        model: resolveLiveModel(settings.model.trim() || "gemini-live-2.5-flash-preview"),
+        config: {
+          responseModalities: [Modality.TEXT],
+          temperature: 0.2,
+        },
+        callbacks: {
+          onmessage: (event: LiveServerMessage) => {
+            const delta = event.text ?? "";
+            if (delta) {
+              if (!liveReplyMessageIdRef.current) {
+                liveReplyBufferRef.current = "";
+                liveReplyMessageIdRef.current = addLocalMessage("assistant", "");
+              }
+              liveReplyBufferRef.current += delta;
+              updateLocalMessage(
+                liveReplyMessageIdRef.current,
+                liveReplyBufferRef.current,
+              );
+            }
+
+            if (event.serverContent?.turnComplete) {
+              if (
+                liveReplyMessageIdRef.current &&
+                !liveReplyBufferRef.current.trim()
+              ) {
+                updateLocalMessage(
+                  liveReplyMessageIdRef.current,
+                  "I couldn't produce a response.",
+                );
+              }
+
+              liveReplyBufferRef.current = "";
+              liveReplyMessageIdRef.current = null;
+              setThinkingState(false);
+
+              const shouldResumeListening =
+                isConversationActiveRef.current &&
+                (!settings.ttsEnabled || !("speechSynthesis" in window));
+              if (shouldResumeListening) {
+                resumeConversationAfterReplyRef.current = false;
+                startConversationListening();
+              }
+            }
+          },
+          onerror: (e) => {
+            setThinkingState(false);
+            setErrorState(String(e.error ?? "Gemini Live connection error."));
+          },
+          onclose: () => {
+            liveSessionRef.current = null;
+            conversationListeningRef.current = false;
+            setIsListening(false);
+
+            if (
+              shouldAutoRestartConversationRef.current &&
+              isConversationActiveRef.current &&
+              settings.voiceMode === "conversation"
+            ) {
+              window.setTimeout(() => {
+                void connectLiveSessionRef.current?.().then((connected) => {
+                  if (connected) {
+                    startConversationListening();
+                  }
+                });
+              }, 300);
+            }
+          },
+        },
+      });
+
+      liveSessionRef.current = session;
+      setErrorState(null);
+      return true;
+    } catch (err) {
+      setErrorState(`Failed to connect Gemini Live: ${String(err)}`);
+      return false;
+    }
+  }, [
+    addLocalMessage,
+    setErrorState,
+    setThinkingState,
+    settings.apiKey,
+    settings.model,
+    settings.ttsEnabled,
+    settings.voiceMode,
+    startConversationListening,
+    updateLocalMessage,
+  ]);
+
+  useEffect(() => {
+    connectLiveSessionRef.current = connectLiveSession;
+  }, [connectLiveSession]);
+
+  const sendLiveTurn = useCallback(
+    async (rawText: string) => {
+      const trimmed = rawText.trim();
+      if (!trimmed) return;
+
+      const session = liveSessionRef.current;
+      if (!session) {
+        await sendWithContext(trimmed, true);
+        return;
+      }
+
+      addLocalMessage("user", trimmed);
+      setThinkingState(true);
+      setErrorState(null);
+
+      liveReplyBufferRef.current = "";
+      liveReplyMessageIdRef.current = null;
+
+      const prompt = buildLivePrompt(trimmed);
+      const pageImage = captureCurrentPageImage();
+      const parts: Array<
+        { text: string } | { inlineData: { mimeType: string; data: string } }
+      > = [{ text: prompt }];
+
+      if (pageImage?.base64Data) {
+        parts.push({
+          inlineData: {
+            mimeType: pageImage.mediaType,
+            data: pageImage.base64Data,
+          },
+        });
+      }
+
+      session.sendClientContent({
+        turns: [{ role: "user", parts }],
+        turnComplete: true,
+      });
+    },
+    [
+      addLocalMessage,
+      buildLivePrompt,
+      captureCurrentPageImage,
+      sendWithContext,
+      setErrorState,
+      setThinkingState,
+    ],
+  );
+
+  const flushConversationTurn = useCallback(async () => {
+    clearConversationSendTimer();
+
+    const text = conversationPendingTextRef.current.trim();
+    if (!text || isThinkingRef.current) return;
+
+    conversationPendingTextRef.current = "";
+    setConversationInterimText("");
+    setInput("");
+
+    stopConversationListening(false);
+    resumeConversationAfterReplyRef.current = true;
+
+    await sendLiveTurn(text);
+
+    const canSpeak = settings.ttsEnabled && "speechSynthesis" in window;
+    if (!canSpeak && isConversationActiveRef.current) {
+      resumeConversationAfterReplyRef.current = false;
+      startConversationListening();
+    }
+  }, [
+    clearConversationSendTimer,
+    sendLiveTurn,
+    settings.ttsEnabled,
+    startConversationListening,
+    stopConversationListening,
+  ]);
+
+  const scheduleConversationTurnSend = useCallback(() => {
+    clearConversationSendTimer();
+    conversationSendTimerRef.current = window.setTimeout(() => {
+      void flushConversationTurn();
+    }, CONVERSATION_SEND_DEBOUNCE_MS);
+  }, [clearConversationSendTimer, flushConversationTurn]);
+
+  const createPushToTalkRecognition = useCallback(() => {
+    const ctor = getSpeechRecognitionCtor();
+    if (!ctor) return null;
+
+    const recognition = new ctor();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0]?.transcript ?? "")
+        .join(" ")
+        .trim();
+
+      if (transcript) {
+        setInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
+      }
+    };
+
+    recognition.onerror = () => {
+      pushToTalkListeningRef.current = false;
+      if (settings.voiceMode === "push-to-talk") {
+        setIsListening(false);
+      }
+    };
+
+    recognition.onend = () => {
+      pushToTalkListeningRef.current = false;
+      if (settings.voiceMode === "push-to-talk") {
+        setIsListening(false);
+      }
+    };
+
+    return recognition;
+  }, [getSpeechRecognitionCtor, settings.voiceMode]);
+
+  const createConversationRecognition = useCallback(() => {
+    const ctor = getSpeechRecognitionCtor();
+    if (!ctor) return null;
+
+    const recognition = new ctor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event) => {
+      let interim = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const transcript = result[0]?.transcript?.trim() ?? "";
+        if (!transcript) continue;
+
+        if (result.isFinal) {
+          conversationPendingTextRef.current = [
+            conversationPendingTextRef.current,
+            transcript,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .trim();
+        } else {
+          interim = [interim, transcript].filter(Boolean).join(" ").trim();
+        }
+      }
+
+      const preview = [conversationPendingTextRef.current, interim]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+
+      setConversationInterimText(preview);
+      setInput(preview);
+
+      if (conversationPendingTextRef.current) {
+        scheduleConversationTurnSend();
+      }
+    };
+
+    recognition.onerror = () => {
+      conversationListeningRef.current = false;
+      if (settings.voiceMode === "conversation") {
+        setIsListening(false);
+      }
+    };
+
+    recognition.onend = () => {
+      conversationListeningRef.current = false;
+      if (settings.voiceMode === "conversation") {
+        setIsListening(false);
+      }
+
+      if (
+        isConversationActiveRef.current &&
+        shouldAutoRestartConversationRef.current &&
+        settings.voiceMode === "conversation" &&
+        !isThinkingRef.current &&
+        !isSpeakingRef.current
+      ) {
+        window.setTimeout(() => {
+          startConversationListening();
+        }, 120);
+      }
+    };
+
+    return recognition;
+  }, [
+    getSpeechRecognitionCtor,
+    scheduleConversationTurnSend,
+    settings.voiceMode,
+    startConversationListening,
+  ]);
+
+  const handlePushToTalkStart = useCallback(() => {
+    if (settings.voiceMode !== "push-to-talk") return;
+    if (pushToTalkListeningRef.current) return;
+
+    const recognition =
+      pushToTalkRecognitionRef.current ?? createPushToTalkRecognition();
+    if (!recognition) return;
+    pushToTalkRecognitionRef.current = recognition;
+
+    try {
+      pushToTalkListeningRef.current = true;
+      setIsListening(true);
+      recognition.start();
+    } catch {
+      pushToTalkListeningRef.current = false;
+      setIsListening(false);
+    }
+  }, [createPushToTalkRecognition, settings.voiceMode]);
+
+  const handlePushToTalkStop = useCallback(() => {
+    if (!pushToTalkListeningRef.current) return;
+
+    pushToTalkListeningRef.current = false;
+    if (settings.voiceMode === "push-to-talk") {
+      setIsListening(false);
+    }
+
+    try {
+      pushToTalkRecognitionRef.current?.stop();
+    } catch {
+      // Ignore recognition stop errors.
+    }
+  }, [settings.voiceMode]);
+
+  const stopConversationMode = useCallback(() => {
+    shouldAutoRestartConversationRef.current = false;
+    resumeConversationAfterReplyRef.current = false;
+
+    clearConversationSendTimer();
+    conversationPendingTextRef.current = "";
+    setConversationInterimText("");
+    liveReplyBufferRef.current = "";
+    liveReplyMessageIdRef.current = null;
+
+    setIsConversationActive(false);
+    stopConversationListening(true);
+
+    try {
+      liveSessionRef.current?.close();
+    } catch {
+      // Ignore close errors.
+    }
+    liveSessionRef.current = null;
+
+    if (settings.voiceMode === "conversation") {
+      setIsListening(false);
+      setInput("");
+    }
+
+    setThinkingState(false);
+  }, [
+    clearConversationSendTimer,
+    settings.voiceMode,
+    setThinkingState,
+    stopConversationListening,
+  ]);
+
+  const startConversationMode = useCallback(async () => {
+    if (settings.voiceMode !== "conversation") return;
+
+    const recognition =
+      conversationRecognitionRef.current ?? createConversationRecognition();
+    if (!recognition) {
+      setErrorState("Speech recognition is not available in this environment.");
+      return;
+    }
+
+    conversationRecognitionRef.current = recognition;
+
+    const connected = await connectLiveSession();
+    if (!connected) return;
+
+    shouldAutoRestartConversationRef.current = true;
+    setIsConversationActive(true);
+    startConversationListening();
+  }, [
+    connectLiveSession,
+    createConversationRecognition,
+    setErrorState,
+    settings.voiceMode,
+    startConversationListening,
+  ]);
+
+  const toggleConversationMode = useCallback(() => {
+    if (isConversationActiveRef.current) {
+      stopConversationMode();
+    } else {
+      void startConversationMode();
+    }
+  }, [startConversationMode, stopConversationMode]);
+
+  useEffect(() => {
+    if (!settings.ttsEnabled) return;
+    if (isThinking) return;
+    if (!latestAssistantMessage) return;
+    if (latestAssistantMessage.id === lastSpokenMessageIdRef.current) return;
+    if (!("speechSynthesis" in window)) return;
+
+    lastSpokenMessageIdRef.current = latestAssistantMessage.id;
+    const synth = window.speechSynthesis;
+
+    synth.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(latestAssistantMessage.content);
+    utterance.rate = 1;
+    utterance.pitch = 1;
+
+    utterance.onstart = () => {
+      isSpeakingRef.current = true;
+    };
+
+    const handleSpeechDone = () => {
+      isSpeakingRef.current = false;
+      if (resumeConversationAfterReplyRef.current && isConversationActiveRef.current) {
+        resumeConversationAfterReplyRef.current = false;
+        startConversationListening();
+      }
+    };
+
+    utterance.onend = handleSpeechDone;
+    utterance.onerror = handleSpeechDone;
+
+    synth.speak(utterance);
+  }, [isThinking, latestAssistantMessage, settings.ttsEnabled, startConversationListening]);
+
+  useEffect(() => {
+    return () => {
+      clearConversationSendTimer();
+      handlePushToTalkStop();
+      stopConversationMode();
+      if ("speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, [clearConversationSendTimer, handlePushToTalkStop, stopConversationMode]);
+
+  const handleSubmit = useCallback(
+    async (e?: React.FormEvent) => {
+      e?.preventDefault();
+      const trimmed = input.trim();
+      if (!trimmed || isThinkingRef.current) return;
+
+      const conversationMode = settings.voiceMode === "conversation";
+      if (conversationMode && isConversationActiveRef.current) {
+        stopConversationListening(false);
+        resumeConversationAfterReplyRef.current = true;
+      }
+
+      setInput("");
+      setConversationInterimText("");
+      conversationPendingTextRef.current = "";
+
+      if (conversationMode && isConversationActiveRef.current) {
+        await sendLiveTurn(trimmed);
+      } else {
+        await sendWithContext(trimmed, conversationMode);
+      }
+
+      if (
+        conversationMode &&
+        isConversationActiveRef.current &&
+        (!settings.ttsEnabled || !("speechSynthesis" in window))
+      ) {
+        resumeConversationAfterReplyRef.current = false;
+        startConversationListening();
+      }
+    },
+    [
+      input,
+      sendLiveTurn,
+      sendWithContext,
+      settings.ttsEnabled,
+      settings.voiceMode,
+      startConversationListening,
+      stopConversationListening,
     ],
   );
 
@@ -297,14 +833,23 @@ export function AiPanel() {
             <select
               className="w-full rounded border bg-background px-2 py-1 outline-none focus:ring-1 focus:ring-primary"
               value={settings.voiceMode}
-              onChange={(e) =>
-                setSettings({
-                  voiceMode: e.target.value as "off" | "push-to-talk",
-                })
-              }
+              onChange={(e) => {
+                const nextVoiceMode = e.target.value as
+                  | "off"
+                  | "push-to-talk"
+                  | "conversation";
+                if (nextVoiceMode !== "conversation") {
+                  stopConversationMode();
+                }
+                if (nextVoiceMode !== "push-to-talk") {
+                  handlePushToTalkStop();
+                }
+                setSettings({ voiceMode: nextVoiceMode });
+              }}
             >
               <option value="off">Off</option>
               <option value="push-to-talk">Push-to-talk</option>
+              <option value="conversation">Conversation</option>
             </select>
           </label>
 
@@ -319,14 +864,24 @@ export function AiPanel() {
         </div>
       )}
 
-      <div
-        ref={listRef}
-        className="flex-1 space-y-3 overflow-auto px-3 py-3"
-      >
+      <div ref={listRef} className="flex-1 space-y-3 overflow-auto px-3 py-3">
         {messages.length === 0 && (
           <div className="rounded border bg-muted/40 p-3 text-xs text-muted-foreground">
             Ask anything about the PDF. The assistant can navigate pages and create
             notes/highlights.
+          </div>
+        )}
+
+        {settings.voiceMode === "conversation" && isConversationActive && (
+          <div className="rounded border border-emerald-300/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700">
+            Gemini Live mode is active.
+            {isListening ? " Listening..." : isThinking ? " Thinking..." : ""}
+          </div>
+        )}
+
+        {conversationInterimText && settings.voiceMode === "conversation" && (
+          <div className="rounded border bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+            {conversationInterimText}
           </div>
         )}
 
@@ -366,7 +921,11 @@ export function AiPanel() {
         <form className="flex items-end gap-2" onSubmit={handleSubmit}>
           <textarea
             className="min-h-[2.5rem] flex-1 resize-none rounded border bg-background px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-primary"
-            placeholder="Ask about this document..."
+            placeholder={
+              settings.voiceMode === "conversation"
+                ? "Speak or type in conversation mode..."
+                : "Ask about this document..."
+            }
             value={input}
             rows={2}
             onChange={(e) => setInput(e.target.value)}
@@ -401,6 +960,27 @@ export function AiPanel() {
               title="Push to talk"
             >
               {isListening ? <Square size={14} /> : <Mic size={14} />}
+            </button>
+          )}
+
+          {settings.voiceMode === "conversation" && (
+            <button
+              type="button"
+              className={cn(
+                "inline-flex h-10 items-center gap-1 rounded border px-2 text-xs transition-colors",
+                isConversationActive
+                  ? "border-emerald-400 bg-emerald-100 text-emerald-700"
+                  : "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+              onClick={toggleConversationMode}
+              title={
+                isConversationActive
+                  ? "Stop conversation mode"
+                  : "Start conversation mode"
+              }
+            >
+              {isConversationActive ? <Square size={12} /> : <Mic size={12} />}
+              {isConversationActive ? "Stop" : "Talk"}
             </button>
           )}
 
