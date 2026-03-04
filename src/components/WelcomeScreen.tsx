@@ -11,7 +11,7 @@ export function WelcomeScreen() {
       multiple: false,
       filters: [
         {
-          name: "Research Reader / PDF",
+          name: "Research Reader / PDF (convert to .rr)",
           extensions: ["rr", "pdf"],
         },
       ],
@@ -27,7 +27,7 @@ export function WelcomeScreen() {
         <FileText size={48} className="text-muted-foreground" />
         <h1 className="text-2xl font-semibold">Research Reader</h1>
         <p className="text-sm text-muted-foreground">
-          Open a PDF or .rr file to get started
+          Open a .rr file, or import a PDF (it will be converted to .rr)
         </p>
       </div>
 

@@ -12,7 +12,7 @@ pub struct AppState {
     pub session: Mutex<Option<RrSession>>,
 }
 
-/// Open a .rr file or import a PDF
+/// Open a .rr file or import a PDF (converted to .rr)
 #[tauri::command]
 pub fn open_file(path: String, state: State<AppState>) -> Result<DocumentInfo, String> {
     let path = PathBuf::from(&path);

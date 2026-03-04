@@ -4,6 +4,6 @@ export function confirmPdfImport(path: string): boolean {
   }
 
   return window.confirm(
-    "Import this PDF into a new .rr file next to the original PDF?",
+    "Convert this PDF to a .rr file and replace the original PDF?",
   );
 }

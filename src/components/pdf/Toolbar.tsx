@@ -59,7 +59,7 @@ export function Toolbar() {
       multiple: false,
       filters: [
         {
-          name: "Research Reader / PDF",
+          name: "Research Reader / PDF (convert to .rr)",
           extensions: ["rr", "pdf"],
         },
       ],
