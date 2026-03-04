@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { DocumentInfo } from "@/types";
 import * as commands from "@/lib/tauri-commands";
+import type { OpenFileOptions } from "@/lib/tauri-commands";
 
 export type InteractionMode = "view" | "note";
 
@@ -20,7 +21,7 @@ interface PdfState {
   mode: InteractionMode;
 
   // Actions
-  openFile: (path: string) => Promise<void>;
+  openFile: (path: string, options?: OpenFileOptions) => Promise<void>;
   closeFile: () => Promise<void>;
   setCurrentPage: (page: number) => void;
   setNumPages: (num: number) => void;
@@ -46,10 +47,10 @@ export const usePdfStore = create<PdfState>((set, get) => ({
   visiblePages: [],
   mode: "view",
 
-  openFile: async (path: string) => {
+  openFile: async (path: string, options?: OpenFileOptions) => {
     set({ isLoading: true, error: null });
     try {
-      const doc = await commands.openFile(path);
+      const doc = await commands.openFile(path, options);
       set({
         document: doc,
         isLoading: false,

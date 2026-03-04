@@ -71,13 +71,17 @@ pub fn open_rr(rr_path: &Path) -> Result<RrSession, String> {
 
 /// Import a raw PDF into a new .rr file.
 /// Creates the .rr container next to the PDF (or at the specified output path).
-/// When no output path is provided, the original PDF is removed after a successful pack.
-pub fn import_pdf(pdf_path: &Path, output_path: Option<&Path>) -> Result<RrSession, String> {
+/// When `replace_source_pdf` is true, the source PDF is removed after a successful pack.
+pub fn import_pdf(
+    pdf_path: &Path,
+    output_path: Option<&Path>,
+    replace_source_pdf: bool,
+) -> Result<RrSession, String> {
     let rr_path = match output_path {
         Some(p) => p.to_path_buf(),
         None => pdf_path.with_extension("rr"),
     };
-    let should_replace_source_pdf = output_path.is_none() && rr_path != pdf_path;
+    let should_replace_source_pdf = replace_source_pdf && rr_path != pdf_path;
 
     let work_dir = tempfile::tempdir()
         .map_err(|e| format!("Failed to create temp dir: {}", e))?
