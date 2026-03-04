@@ -9,7 +9,7 @@ import { AnnotationSidebar } from "@/components/annotations/AnnotationSidebar";
 import { AiPanel } from "@/components/ai/AiPanel";
 import { WelcomeScreen } from "@/components/WelcomeScreen";
 import * as commands from "@/lib/tauri-commands";
-import { confirmPdfImport } from "@/lib/pdf-import";
+import { getPdfImportDecision } from "@/lib/pdf-import";
 import { MessageSquare, PanelRightClose, PanelRightOpen, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -59,12 +59,19 @@ export default function App() {
       const selected = await open({
         multiple: false,
         filters: [
-          { name: "Research Reader / PDF", extensions: ["rr", "pdf"] },
+          {
+            name: "Research Reader / PDF (convert to .rr)",
+            extensions: ["rr", "pdf"],
+          },
         ],
       });
       const selectedPath = Array.isArray(selected) ? selected[0] : selected;
-      if (!selectedPath || !confirmPdfImport(selectedPath)) return;
-      await usePdfStore.getState().openFile(selectedPath);
+      if (!selectedPath) return;
+      const decision = getPdfImportDecision(selectedPath);
+      if (!decision.shouldOpen) return;
+      await usePdfStore
+        .getState()
+        .openFile(selectedPath, { replacePdf: decision.replacePdf });
     }
 
     if (isCtrl && e.key === "s") {

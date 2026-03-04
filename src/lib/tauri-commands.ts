@@ -8,8 +8,18 @@ import type {
   UpdateAnnotationInput,
 } from "@/types";
 
-export async function openFile(path: string): Promise<DocumentInfo> {
-  return invoke<DocumentInfo>("open_file", { path });
+export interface OpenFileOptions {
+  replacePdf?: boolean;
+}
+
+export async function openFile(
+  path: string,
+  options?: OpenFileOptions,
+): Promise<DocumentInfo> {
+  return invoke<DocumentInfo>("open_file", {
+    path,
+    replacePdf: options?.replacePdf ?? null,
+  });
 }
 
 export async function saveFile(): Promise<void> {

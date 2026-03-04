@@ -1,7 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { usePdfStore } from "@/stores/pdf-store";
 import { FileText, FolderOpen } from "lucide-react";
-import { confirmPdfImport } from "@/lib/pdf-import";
+import { getPdfImportDecision } from "@/lib/pdf-import";
 
 export function WelcomeScreen() {
   const { openFile, isLoading, error } = usePdfStore();
@@ -11,14 +11,16 @@ export function WelcomeScreen() {
       multiple: false,
       filters: [
         {
-          name: "Research Reader / PDF",
+          name: "Research Reader / PDF (convert to .rr)",
           extensions: ["rr", "pdf"],
         },
       ],
     });
     const selectedPath = Array.isArray(selected) ? selected[0] : selected;
-    if (!selectedPath || !confirmPdfImport(selectedPath)) return;
-    await openFile(selectedPath);
+    if (!selectedPath) return;
+    const decision = getPdfImportDecision(selectedPath);
+    if (!decision.shouldOpen) return;
+    await openFile(selectedPath, { replacePdf: decision.replacePdf });
   };
 
   return (
@@ -27,7 +29,7 @@ export function WelcomeScreen() {
         <FileText size={48} className="text-muted-foreground" />
         <h1 className="text-2xl font-semibold">Research Reader</h1>
         <p className="text-sm text-muted-foreground">
-          Open a PDF or .rr file to get started
+          Open a .rr file, or import a PDF (replace by default)
         </p>
       </div>
 

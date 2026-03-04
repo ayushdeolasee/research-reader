@@ -12,9 +12,14 @@ pub struct AppState {
     pub session: Mutex<Option<RrSession>>,
 }
 
-/// Open a .rr file or import a PDF
+/// Open a .rr file or import a PDF.
+/// For PDFs, `replace_pdf` defaults to true (replace source with .rr).
 #[tauri::command]
-pub fn open_file(path: String, state: State<AppState>) -> Result<DocumentInfo, String> {
+pub fn open_file(
+    path: String,
+    replace_pdf: Option<bool>,
+    state: State<AppState>,
+) -> Result<DocumentInfo, String> {
     let path = PathBuf::from(&path);
     let ext = path
         .extension()
@@ -24,7 +29,7 @@ pub fn open_file(path: String, state: State<AppState>) -> Result<DocumentInfo, S
 
     let session = match ext.as_str() {
         "rr" => rr_file::open_rr(&path)?,
-        "pdf" => rr_file::import_pdf(&path, None)?,
+        "pdf" => rr_file::import_pdf(&path, None, replace_pdf.unwrap_or(true))?,
         _ => return Err(format!("Unsupported file type: .{}", ext)),
     };
 

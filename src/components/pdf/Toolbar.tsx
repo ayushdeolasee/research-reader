@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { usePdfStore } from "@/stores/pdf-store";
 import * as commands from "@/lib/tauri-commands";
-import { confirmPdfImport } from "@/lib/pdf-import";
+import { getPdfImportDecision } from "@/lib/pdf-import";
 import {
   FolderOpen,
   ZoomIn,
@@ -59,14 +59,16 @@ export function Toolbar() {
       multiple: false,
       filters: [
         {
-          name: "Research Reader / PDF",
+          name: "Research Reader / PDF (convert to .rr)",
           extensions: ["rr", "pdf"],
         },
       ],
     });
     const selectedPath = Array.isArray(selected) ? selected[0] : selected;
-    if (!selectedPath || !confirmPdfImport(selectedPath)) return;
-    await openFile(selectedPath);
+    if (!selectedPath) return;
+    const decision = getPdfImportDecision(selectedPath);
+    if (!decision.shouldOpen) return;
+    await openFile(selectedPath, { replacePdf: decision.replacePdf });
   };
 
   const handleSave = async () => {
