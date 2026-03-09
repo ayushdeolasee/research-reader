@@ -8,6 +8,9 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "website:dev": "vite --config website/vite.config.ts",
+    "website:build": "vite build --config website/vite.config.ts",
+    "website:preview": "vite preview --config website/vite.config.ts",
     "tauri": "tauri"
   },
   "dependencies": {

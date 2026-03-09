@@ -27,6 +27,17 @@ type SpeechRecognitionLike = {
   stop: () => void;
 };
 
+type ConversationPhase =
+  | "idle"
+  | "connecting"
+  | "ready"
+  | "listening"
+  | "capturing"
+  | "sending"
+  | "responding"
+  | "speaking"
+  | "error";
+
 const MODELS = [
   "gemini-3.1-flash-lite",
   "gemini-3-pro-preview",
@@ -47,10 +58,66 @@ const SNAPSHOT_MAX_DIMENSION = 1280;
 const SNAPSHOT_JPEG_QUALITY = 0.72;
 const CONVERSATION_SEND_DEBOUNCE_MS = 900;
 const MAX_LIVE_CONTEXT_CHARS = 9_000;
+const LIVE_RESPONSE_TIMEOUT_MS = 25_000;
+const LIVE_RECONNECT_DELAY_MS = 900;
+const MAX_LIVE_RECONNECT_ATTEMPTS = 3;
 
 function resolveLiveModel(model: string): string {
   if (model.includes("live")) return model;
   return "gemini-live-2.5-flash-preview";
+}
+
+function extractLiveText(event: LiveServerMessage): string {
+  const direct = typeof event.text === "string" ? event.text : "";
+  if (direct) return direct;
+
+  const parts = event.serverContent?.modelTurn?.parts;
+  if (Array.isArray(parts)) {
+    const fromParts = parts
+      .map((part) => {
+        if (!part || typeof part !== "object") return "";
+        const text = (part as { text?: unknown }).text;
+        return typeof text === "string" ? text : "";
+      })
+      .join("");
+    if (fromParts) return fromParts;
+  }
+
+  const outputTranscription = event.serverContent?.outputTranscription?.text;
+  return typeof outputTranscription === "string" ? outputTranscription : "";
+}
+
+function isFatalLiveError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("invalid api key") ||
+    normalized.includes("permission denied") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("forbidden") ||
+    normalized.includes("model not found") ||
+    normalized.includes("unsupported model") ||
+    normalized.includes("invalid argument") ||
+    normalized.includes("handshake status 400") ||
+    normalized.includes("handshake status 401") ||
+    normalized.includes("handshake status 403") ||
+    normalized.includes("handshake status 404")
+  );
+}
+
+function isFatalLiveClose(code: number, reason: string): boolean {
+  const normalized = reason.toLowerCase();
+  if (code === 1002 || code === 1003 || code === 1007 || code === 1008) {
+    return true;
+  }
+  return (
+    normalized.includes("invalid api key") ||
+    normalized.includes("permission denied") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("forbidden") ||
+    normalized.includes("model not found") ||
+    normalized.includes("unsupported model") ||
+    normalized.includes("invalid argument")
+  );
 }
 
 export function AiPanel() {
@@ -79,6 +146,8 @@ export function AiPanel() {
   const [isListening, setIsListening] = useState(false);
   const [isConversationActive, setIsConversationActive] = useState(false);
   const [conversationInterimText, setConversationInterimText] = useState("");
+  const [conversationPhase, setConversationPhase] = useState<ConversationPhase>("idle");
+  const [liveReconnectAttempt, setLiveReconnectAttempt] = useState(0);
 
   const pushToTalkRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const conversationRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -86,6 +155,12 @@ export function AiPanel() {
   const connectLiveSessionRef = useRef<(() => Promise<boolean>) | null>(null);
   const liveReplyMessageIdRef = useRef<string | null>(null);
   const liveReplyBufferRef = useRef("");
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const suppressReconnectOnCloseRef = useRef(false);
+  const connectInFlightRef = useRef(false);
+  const liveConnectedAtRef = useRef(0);
+  const liveSessionReadyRef = useRef(false);
 
   const listRef = useRef<HTMLDivElement>(null);
   const lastSpokenMessageIdRef = useRef<string | null>(null);
@@ -93,6 +168,7 @@ export function AiPanel() {
   const conversationListeningRef = useRef(false);
   const conversationPendingTextRef = useRef("");
   const conversationSendTimerRef = useRef<number | null>(null);
+  const liveResponseTimeoutRef = useRef<number | null>(null);
   const shouldAutoRestartConversationRef = useRef(false);
   const resumeConversationAfterReplyRef = useRef(false);
   const isThinkingRef = useRef(false);
@@ -119,12 +195,114 @@ export function AiPanel() {
     return null;
   }, [messages]);
 
+  const conversationStatusMeta = useMemo(() => {
+    if (!isConversationActive) {
+      return {
+        label: "Off",
+        className: "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground",
+      };
+    }
+
+    switch (conversationPhase) {
+      case "connecting":
+        return {
+          label:
+            liveReconnectAttempt > 0
+              ? `Retry ${liveReconnectAttempt}`
+              : "Connecting",
+          className: "border-amber-400 bg-amber-100 text-amber-800",
+        };
+      case "listening":
+        return {
+          label: "Listening",
+          className: "border-emerald-400 bg-emerald-100 text-emerald-800",
+        };
+      case "capturing":
+        return {
+          label: "Capturing",
+          className: "border-sky-400 bg-sky-100 text-sky-800",
+        };
+      case "sending":
+        return {
+          label: "Sending",
+          className: "border-violet-400 bg-violet-100 text-violet-800",
+        };
+      case "responding":
+        return {
+          label: "Responding",
+          className: "border-blue-400 bg-blue-100 text-blue-800",
+        };
+      case "speaking":
+        return {
+          label: "Speaking",
+          className: "border-fuchsia-400 bg-fuchsia-100 text-fuchsia-800",
+        };
+      case "error":
+        return {
+          label: "Retry",
+          className: "border-destructive bg-destructive/15 text-destructive",
+        };
+      case "ready":
+      case "idle":
+      default:
+        return {
+          label: "On",
+          className: "border-emerald-400 bg-emerald-100 text-emerald-800",
+        };
+    }
+  }, [conversationPhase, isConversationActive, liveReconnectAttempt]);
+
   const clearConversationSendTimer = useCallback(() => {
     if (conversationSendTimerRef.current !== null) {
       window.clearTimeout(conversationSendTimerRef.current);
       conversationSendTimerRef.current = null;
     }
   }, []);
+
+  const clearLiveResponseTimeout = useCallback(() => {
+    if (liveResponseTimeoutRef.current !== null) {
+      window.clearTimeout(liveResponseTimeoutRef.current);
+      liveResponseTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleLiveResponseTimeout = useCallback(() => {
+    clearLiveResponseTimeout();
+    liveResponseTimeoutRef.current = window.setTimeout(() => {
+      if (!isThinkingRef.current) return;
+
+      setThinkingState(false);
+      setErrorState("Gemini Live did not return a response. Please try again.");
+      setConversationPhase("error");
+
+      if (liveReplyMessageIdRef.current) {
+        if (!liveReplyBufferRef.current.trim()) {
+          updateLocalMessage(
+            liveReplyMessageIdRef.current,
+            "I couldn't get a response from Gemini Live.",
+          );
+        }
+      } else {
+        addLocalMessage("assistant", "I couldn't get a response from Gemini Live.");
+      }
+
+      liveReplyBufferRef.current = "";
+      liveReplyMessageIdRef.current = null;
+    }, LIVE_RESPONSE_TIMEOUT_MS);
+  }, [
+    addLocalMessage,
+    clearLiveResponseTimeout,
+    setErrorState,
+    setThinkingState,
+    updateLocalMessage,
+  ]);
 
   const getSpeechRecognitionCtor = useCallback(() => {
     return (
@@ -150,7 +328,11 @@ export function AiPanel() {
     } catch {
       // Ignore recognition stop errors.
     }
-  }, []);
+
+    if (isConversationActiveRef.current && settings.voiceMode === "conversation") {
+      setConversationPhase("ready");
+    }
+  }, [settings.voiceMode]);
 
   const startConversationListening = useCallback(() => {
     if (settings.voiceMode !== "conversation") return;
@@ -166,10 +348,12 @@ export function AiPanel() {
     try {
       conversationListeningRef.current = true;
       setIsListening(true);
+      setConversationPhase("listening");
       recognition.start();
     } catch {
       conversationListeningRef.current = false;
       setIsListening(false);
+      setConversationPhase("error");
     }
   }, [settings.voiceMode]);
 
@@ -279,22 +463,35 @@ export function AiPanel() {
   );
 
   const connectLiveSession = useCallback(async () => {
+    if (connectInFlightRef.current) {
+      return false;
+    }
+
     const apiKey = settings.apiKey.trim();
     if (!apiKey) {
       setErrorState("Set your Gemini API key in AI settings.");
       return false;
     }
 
+    connectInFlightRef.current = true;
+
     try {
-      liveSessionRef.current?.close();
+      if (liveSessionRef.current) {
+        suppressReconnectOnCloseRef.current = true;
+        liveSessionRef.current.close();
+      }
     } catch {
       // Ignore close errors.
     }
+    clearReconnectTimer();
     liveSessionRef.current = null;
     liveReplyBufferRef.current = "";
     liveReplyMessageIdRef.current = null;
+    liveConnectedAtRef.current = 0;
+    liveSessionReadyRef.current = false;
 
     try {
+      setConversationPhase("connecting");
       const ai = new GoogleGenAI({ apiKey });
       const session = await ai.live.connect({
         model: resolveLiveModel(settings.model.trim() || "gemini-live-2.5-flash-preview"),
@@ -303,9 +500,26 @@ export function AiPanel() {
           temperature: 0.2,
         },
         callbacks: {
+          onopen: () => {
+            liveConnectedAtRef.current = Date.now();
+            liveSessionReadyRef.current = false;
+            if (isConversationActiveRef.current) {
+              setConversationPhase("ready");
+            }
+          },
           onmessage: (event: LiveServerMessage) => {
-            const delta = event.text ?? "";
+            if (
+              event.setupComplete ||
+              event.serverContent?.modelTurn ||
+              event.serverContent?.outputTranscription
+            ) {
+              liveSessionReadyRef.current = true;
+            }
+
+            const delta = extractLiveText(event);
             if (delta) {
+              scheduleLiveResponseTimeout();
+              setConversationPhase("responding");
               if (!liveReplyMessageIdRef.current) {
                 liveReplyBufferRef.current = "";
                 liveReplyMessageIdRef.current = addLocalMessage("assistant", "");
@@ -317,7 +531,15 @@ export function AiPanel() {
               );
             }
 
-            if (event.serverContent?.turnComplete) {
+            const turnComplete = Boolean(
+              event.serverContent?.turnComplete ||
+                event.serverContent?.generationComplete,
+            );
+
+            if (turnComplete) {
+              clearLiveResponseTimeout();
+              reconnectAttemptRef.current = 0;
+              setLiveReconnectAttempt(0);
               if (
                 liveReplyMessageIdRef.current &&
                 !liveReplyBufferRef.current.trim()
@@ -326,6 +548,12 @@ export function AiPanel() {
                   liveReplyMessageIdRef.current,
                   "I couldn't produce a response.",
                 );
+              }
+              if (
+                !liveReplyMessageIdRef.current &&
+                !event.serverContent?.waitingForInput
+              ) {
+                addLocalMessage("assistant", "I couldn't produce a response.");
               }
 
               liveReplyBufferRef.current = "";
@@ -338,30 +566,97 @@ export function AiPanel() {
               if (shouldResumeListening) {
                 resumeConversationAfterReplyRef.current = false;
                 startConversationListening();
+              } else if (isConversationActiveRef.current) {
+                setConversationPhase(settings.ttsEnabled ? "speaking" : "ready");
               }
             }
           },
           onerror: (e) => {
+            clearLiveResponseTimeout();
             setThinkingState(false);
-            setErrorState(String(e.error ?? "Gemini Live connection error."));
+            const rawMessage = String(e.error ?? "Gemini Live connection error.");
+            if (isFatalLiveError(rawMessage)) {
+              shouldAutoRestartConversationRef.current = false;
+              setErrorState(rawMessage);
+              setConversationPhase("error");
+              return;
+            }
+            const shouldReconnect =
+              shouldAutoRestartConversationRef.current &&
+              isConversationActiveRef.current &&
+              settings.voiceMode === "conversation";
+            if (shouldReconnect) {
+              setErrorState(`Live session interrupted. Reconnecting... (${rawMessage})`);
+              setConversationPhase("connecting");
+            } else {
+              setErrorState(rawMessage);
+              setConversationPhase("error");
+            }
           },
-          onclose: () => {
+          onclose: (event) => {
+            clearLiveResponseTimeout();
+            if (suppressReconnectOnCloseRef.current) {
+              suppressReconnectOnCloseRef.current = false;
+              return;
+            }
+
             liveSessionRef.current = null;
             conversationListeningRef.current = false;
             setIsListening(false);
 
-            if (
+            const closeReason = event.reason?.trim() ?? "";
+            const aliveMs =
+              liveConnectedAtRef.current > 0
+                ? Date.now() - liveConnectedAtRef.current
+                : 0;
+            const startupDrop = !liveSessionReadyRef.current && aliveMs > 0 && aliveMs < 3000;
+            const fatalClose = isFatalLiveClose(event.code, closeReason);
+
+            const shouldReconnect =
               shouldAutoRestartConversationRef.current &&
               isConversationActiveRef.current &&
-              settings.voiceMode === "conversation"
-            ) {
-              window.setTimeout(() => {
+              settings.voiceMode === "conversation";
+
+            if (shouldReconnect) {
+              const nextAttempt = reconnectAttemptRef.current + 1;
+              reconnectAttemptRef.current = nextAttempt;
+              setLiveReconnectAttempt(nextAttempt);
+
+              if (
+                fatalClose ||
+                (startupDrop && nextAttempt >= 2) ||
+                nextAttempt > MAX_LIVE_RECONNECT_ATTEMPTS
+              ) {
+                shouldAutoRestartConversationRef.current = false;
+                const reasonSuffix = closeReason
+                  ? ` ${closeReason}`
+                  : "";
+                const startupHint = startupDrop
+                  ? " Connection dropped immediately after opening."
+                  : "";
+                setErrorState(
+                  `Gemini Live disconnected (code ${event.code}).${startupHint}${reasonSuffix} Press the conversation button to retry.`,
+                );
+                setConversationPhase("error");
+                return;
+              }
+
+              setConversationPhase("connecting");
+              clearReconnectTimer();
+              reconnectTimerRef.current = window.setTimeout(() => {
                 void connectLiveSessionRef.current?.().then((connected) => {
                   if (connected) {
                     startConversationListening();
                   }
                 });
-              }, 300);
+              }, LIVE_RECONNECT_DELAY_MS * nextAttempt);
+            } else if (isConversationActiveRef.current) {
+              const reason = closeReason;
+              const closeMessage = reason
+                ? `Gemini Live disconnected (code ${event.code}): ${reason}`
+                : `Gemini Live disconnected (code ${event.code}).`;
+              setErrorState(closeMessage);
+              setConversationPhase("error");
             }
           },
         },
@@ -369,19 +664,31 @@ export function AiPanel() {
 
       liveSessionRef.current = session;
       setErrorState(null);
+      if (isConversationActiveRef.current) {
+        setConversationPhase("ready");
+      }
       return true;
     } catch (err) {
+      clearLiveResponseTimeout();
       setErrorState(`Failed to connect Gemini Live: ${String(err)}`);
+      setConversationPhase("error");
       return false;
+    } finally {
+      connectInFlightRef.current = false;
     }
   }, [
     addLocalMessage,
+    clearReconnectTimer,
+    clearLiveResponseTimeout,
     setErrorState,
+    setConversationPhase,
+    setLiveReconnectAttempt,
     setThinkingState,
+    settings.ttsEnabled,
     settings.apiKey,
     settings.model,
-    settings.ttsEnabled,
     settings.voiceMode,
+    scheduleLiveResponseTimeout,
     startConversationListening,
     updateLocalMessage,
   ]);
@@ -397,13 +704,18 @@ export function AiPanel() {
 
       const session = liveSessionRef.current;
       if (!session) {
+        setConversationPhase("sending");
         await sendWithContext(trimmed, true);
+        if (isConversationActiveRef.current) {
+          setConversationPhase("ready");
+        }
         return;
       }
 
       addLocalMessage("user", trimmed);
       setThinkingState(true);
       setErrorState(null);
+      setConversationPhase("sending");
 
       liveReplyBufferRef.current = "";
       liveReplyMessageIdRef.current = null;
@@ -423,15 +735,27 @@ export function AiPanel() {
         });
       }
 
-      session.sendClientContent({
-        turns: [{ role: "user", parts }],
-        turnComplete: true,
-      });
+      try {
+        session.sendClientContent({
+          turns: [{ role: "user", parts }],
+          turnComplete: true,
+        });
+        scheduleLiveResponseTimeout();
+      } catch (err) {
+        setThinkingState(false);
+        setErrorState(`Failed to send request to Gemini Live: ${String(err)}`);
+        setConversationPhase("error");
+        addLocalMessage(
+          "assistant",
+          `I couldn't send that request to Gemini Live: ${String(err)}`,
+        );
+      }
     },
     [
       addLocalMessage,
       buildLivePrompt,
       captureCurrentPageImage,
+      scheduleLiveResponseTimeout,
       sendWithContext,
       setErrorState,
       setThinkingState,
@@ -447,6 +771,7 @@ export function AiPanel() {
     conversationPendingTextRef.current = "";
     setConversationInterimText("");
     setInput("");
+    setConversationPhase("sending");
 
     stopConversationListening(false);
     resumeConversationAfterReplyRef.current = true;
@@ -547,6 +872,9 @@ export function AiPanel() {
 
       setConversationInterimText(preview);
       setInput(preview);
+      if (preview) {
+        setConversationPhase("capturing");
+      }
 
       if (conversationPendingTextRef.current) {
         scheduleConversationTurnSend();
@@ -557,6 +885,11 @@ export function AiPanel() {
       conversationListeningRef.current = false;
       if (settings.voiceMode === "conversation") {
         setIsListening(false);
+        if (isConversationActiveRef.current) {
+          setConversationPhase("ready");
+        } else {
+          setConversationPhase("idle");
+        }
       }
     };
 
@@ -564,6 +897,11 @@ export function AiPanel() {
       conversationListeningRef.current = false;
       if (settings.voiceMode === "conversation") {
         setIsListening(false);
+        if (!isConversationActiveRef.current) {
+          setConversationPhase("idle");
+        } else if (!isThinkingRef.current && !isSpeakingRef.current) {
+          setConversationPhase("ready");
+        }
       }
 
       if (
@@ -624,8 +962,12 @@ export function AiPanel() {
   const stopConversationMode = useCallback(() => {
     shouldAutoRestartConversationRef.current = false;
     resumeConversationAfterReplyRef.current = false;
+    reconnectAttemptRef.current = 0;
+    setLiveReconnectAttempt(0);
 
     clearConversationSendTimer();
+    clearLiveResponseTimeout();
+    clearReconnectTimer();
     conversationPendingTextRef.current = "";
     setConversationInterimText("");
     liveReplyBufferRef.current = "";
@@ -635,7 +977,10 @@ export function AiPanel() {
     stopConversationListening(true);
 
     try {
-      liveSessionRef.current?.close();
+      if (liveSessionRef.current) {
+        suppressReconnectOnCloseRef.current = true;
+        liveSessionRef.current.close();
+      }
     } catch {
       // Ignore close errors.
     }
@@ -646,21 +991,30 @@ export function AiPanel() {
       setInput("");
     }
 
+    setConversationPhase("idle");
     setThinkingState(false);
   }, [
     clearConversationSendTimer,
+    clearReconnectTimer,
+    clearLiveResponseTimeout,
     settings.voiceMode,
+    setConversationPhase,
+    setLiveReconnectAttempt,
     setThinkingState,
     stopConversationListening,
   ]);
 
   const startConversationMode = useCallback(async () => {
     if (settings.voiceMode !== "conversation") return;
+    reconnectAttemptRef.current = 0;
+    setLiveReconnectAttempt(0);
+    setConversationPhase("connecting");
 
     const recognition =
       conversationRecognitionRef.current ?? createConversationRecognition();
     if (!recognition) {
       setErrorState("Speech recognition is not available in this environment.");
+      setConversationPhase("error");
       return;
     }
 
@@ -676,17 +1030,33 @@ export function AiPanel() {
     connectLiveSession,
     createConversationRecognition,
     setErrorState,
+    setConversationPhase,
+    setLiveReconnectAttempt,
     settings.voiceMode,
     startConversationListening,
   ]);
 
-  const toggleConversationMode = useCallback(() => {
-    if (isConversationActiveRef.current) {
-      stopConversationMode();
-    } else {
+  const handleConversationAction = useCallback(() => {
+    if (!isConversationActiveRef.current) {
       void startConversationMode();
+      return;
     }
-  }, [startConversationMode, stopConversationMode]);
+
+    if (conversationPhase === "error") {
+      reconnectAttemptRef.current = 0;
+      setLiveReconnectAttempt(0);
+      shouldAutoRestartConversationRef.current = true;
+      setConversationPhase("connecting");
+      void connectLiveSessionRef.current?.().then((connected) => {
+        if (connected) {
+          startConversationListening();
+        }
+      });
+      return;
+    }
+
+    stopConversationMode();
+  }, [conversationPhase, setConversationPhase, setLiveReconnectAttempt, startConversationListening, startConversationMode, stopConversationMode]);
 
   useEffect(() => {
     if (!settings.ttsEnabled) return;
@@ -706,6 +1076,9 @@ export function AiPanel() {
 
     utterance.onstart = () => {
       isSpeakingRef.current = true;
+      if (isConversationActiveRef.current && settings.voiceMode === "conversation") {
+        setConversationPhase("speaking");
+      }
     };
 
     const handleSpeechDone = () => {
@@ -713,6 +1086,8 @@ export function AiPanel() {
       if (resumeConversationAfterReplyRef.current && isConversationActiveRef.current) {
         resumeConversationAfterReplyRef.current = false;
         startConversationListening();
+      } else if (isConversationActiveRef.current) {
+        setConversationPhase("ready");
       }
     };
 
@@ -720,7 +1095,13 @@ export function AiPanel() {
     utterance.onerror = handleSpeechDone;
 
     synth.speak(utterance);
-  }, [isThinking, latestAssistantMessage, settings.ttsEnabled, startConversationListening]);
+  }, [
+    isThinking,
+    latestAssistantMessage,
+    settings.ttsEnabled,
+    settings.voiceMode,
+    startConversationListening,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -872,13 +1253,6 @@ export function AiPanel() {
           </div>
         )}
 
-        {settings.voiceMode === "conversation" && isConversationActive && (
-          <div className="rounded border border-emerald-300/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700">
-            Gemini Live mode is active.
-            {isListening ? " Listening..." : isThinking ? " Thinking..." : ""}
-          </div>
-        )}
-
         {conversationInterimText && settings.voiceMode === "conversation" && (
           <div className="rounded border bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
             {conversationInterimText}
@@ -920,7 +1294,7 @@ export function AiPanel() {
       <div className="border-t p-3">
         <form className="flex items-end gap-2" onSubmit={handleSubmit}>
           <textarea
-            className="min-h-[2.5rem] flex-1 resize-none rounded border bg-background px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-primary"
+            className="min-h-[2.5rem] min-w-0 flex-1 resize-none rounded border bg-background px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-primary"
             placeholder={
               settings.voiceMode === "conversation"
                 ? "Speak or type in conversation mode..."
@@ -967,20 +1341,24 @@ export function AiPanel() {
             <button
               type="button"
               className={cn(
-                "inline-flex h-10 items-center gap-1 rounded border px-2 text-xs transition-colors",
-                isConversationActive
-                  ? "border-emerald-400 bg-emerald-100 text-emerald-700"
-                  : "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground",
+                "inline-flex h-10 shrink-0 items-center justify-center gap-1 rounded border px-2 text-xs font-semibold whitespace-nowrap transition-colors",
+                conversationStatusMeta.className,
               )}
-              onClick={toggleConversationMode}
+              onClick={handleConversationAction}
               title={
                 isConversationActive
-                  ? "Stop conversation mode"
+                  ? conversationPhase === "error"
+                    ? "Retry conversation mode"
+                    : "Stop conversation mode"
                   : "Start conversation mode"
               }
             >
-              {isConversationActive ? <Square size={12} /> : <Mic size={12} />}
-              {isConversationActive ? "Stop" : "Talk"}
+              {isConversationActive && conversationPhase !== "error" ? (
+                <Square size={12} />
+              ) : (
+                <Mic size={12} />
+              )}
+              <span>{conversationStatusMeta.label}</span>
             </button>
           )}
 

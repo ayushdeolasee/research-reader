@@ -38,6 +38,28 @@ npm install
 npm run tauri dev
 ```
 
+## Website (Landing Page)
+
+A standalone marketing website lives in `website/`.
+
+Run it locally:
+
+```bash
+npm run website:dev
+```
+
+Build static output:
+
+```bash
+npm run website:build
+```
+
+Preview production build:
+
+```bash
+npm run website:preview
+```
+
 ## Notes
 
 - AI features use BYOK (bring your own API key) from the in-app AI settings panel.
