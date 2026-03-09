@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useMemo } from "react";
 import type { Annotation } from "@/types";
 import { HIGHLIGHT_COLORS } from "@/types";
 import { useAnnotationStore } from "@/stores/annotation-store";
@@ -21,32 +21,6 @@ export const HighlightLayer = memo(function HighlightLayer({
   const selectAnnotation = useAnnotationStore((s) => s.selectAnnotation);
   const deleteAnnotation = useAnnotationStore((s) => s.deleteAnnotation);
   const updateAnnotation = useAnnotationStore((s) => s.updateAnnotation);
-  const [hoveredHighlightId, setHoveredHighlightId] = useState<string | null>(
-    null,
-  );
-  const [isActionPopoverHovered, setIsActionPopoverHovered] = useState(false);
-  const hoverClearTimeoutRef = useRef<number | null>(null);
-
-  const cancelHoverClear = () => {
-    if (hoverClearTimeoutRef.current !== null) {
-      window.clearTimeout(hoverClearTimeoutRef.current);
-      hoverClearTimeoutRef.current = null;
-    }
-  };
-
-  const scheduleHoverClear = () => {
-    cancelHoverClear();
-    hoverClearTimeoutRef.current = window.setTimeout(() => {
-      setHoveredHighlightId(null);
-    }, 140);
-  };
-
-  useEffect(
-    () => () => {
-      cancelHoverClear();
-    },
-    [],
-  );
 
   const { highlights, notes, selectedHighlight } = useMemo(
     () => ({
@@ -67,9 +41,6 @@ export const HighlightLayer = memo(function HighlightLayer({
   );
 
   if (highlights.length === 0 && notes.length === 0) return null;
-  const showActionPopover =
-    !!selectedHighlight &&
-    (hoveredHighlightId === selectedHighlight.id || isActionPopoverHovered);
 
   return (
     <div className="pointer-events-none absolute inset-0">
@@ -94,15 +65,6 @@ export const HighlightLayer = memo(function HighlightLayer({
               e.stopPropagation();
               selectAnnotation(annotation.id);
             }}
-            onMouseEnter={() => {
-              cancelHoverClear();
-              setHoveredHighlightId(annotation.id);
-            }}
-            onMouseLeave={() => {
-              if (selectedAnnotationId === annotation.id) {
-                scheduleHoverClear();
-              }
-            }}
             onClick={(e) => {
               e.stopPropagation();
             }}
@@ -115,7 +77,7 @@ export const HighlightLayer = memo(function HighlightLayer({
         )),
       )}
 
-      {showActionPopover && selectedHighlight?.position_data?.rects[0] && (
+      {selectedHighlight?.position_data?.rects[0] && (
         <div
           className="pointer-events-auto absolute z-30 rounded-md border bg-background px-2 py-1.5 shadow-md"
           style={{
@@ -125,14 +87,6 @@ export const HighlightLayer = memo(function HighlightLayer({
               zoom,
             top: selectedHighlight.position_data.rects[0].y * zoom - 8,
             transform: "translate(-50%, -100%)",
-          }}
-          onMouseEnter={() => {
-            cancelHoverClear();
-            setIsActionPopoverHovered(true);
-          }}
-          onMouseLeave={() => {
-            setIsActionPopoverHovered(false);
-            scheduleHoverClear();
           }}
         >
           <div className="mb-1 flex items-center gap-1">
