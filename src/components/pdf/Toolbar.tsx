@@ -1,6 +1,8 @@
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { usePdfStore } from "@/stores/pdf-store";
+import type { AppUpdate, AppUpdateDownloadEvent } from "@/lib/app-updates";
+import { checkForAppUpdate, relaunchForUpdate } from "@/lib/app-updates";
 import * as commands from "@/lib/tauri-commands";
 import { confirmPdfImport } from "@/lib/pdf-import";
 import {
@@ -12,6 +14,9 @@ import {
   Save,
   Bookmark,
   StickyNote,
+  Download,
+  LoaderCircle,
+  RefreshCw,
 } from "lucide-react";
 import { useAnnotationStore } from "@/stores/annotation-store";
 import { cn } from "@/lib/utils";
@@ -41,9 +46,133 @@ export function Toolbar() {
 
   // Local state for the page number input so typing isn't interrupted
   const [pageInput, setPageInput] = useState(String(currentPage));
+  const [updateStatus, setUpdateStatus] = useState<
+    "idle" | "checking" | "available" | "downloading" | "restarting" | "error"
+  >("idle");
+  const [updateMessage, setUpdateMessage] = useState("Check for updates");
+  const [availableUpdateVersion, setAvailableUpdateVersion] = useState<string | null>(
+    null,
+  );
+  const [availableUpdateNotes, setAvailableUpdateNotes] = useState<string | null>(
+    null,
+  );
+  const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+  const pendingUpdateRef = useRef<AppUpdate | null>(null);
+
   useEffect(() => {
     setPageInput(String(currentPage));
   }, [currentPage]);
+
+  const clearPendingUpdate = useCallback(async () => {
+    const currentUpdate = pendingUpdateRef.current;
+    pendingUpdateRef.current = null;
+
+    if (currentUpdate) {
+      await currentUpdate.close().catch(() => {});
+    }
+  }, []);
+
+  const handleCheckForUpdates = useCallback(
+    async (silent = false) => {
+      setDownloadProgress(null);
+      setUpdateStatus("checking");
+      if (!silent) {
+        setUpdateMessage("Checking for updates...");
+      }
+
+      try {
+        const nextUpdate = await checkForAppUpdate();
+        await clearPendingUpdate();
+
+        if (!nextUpdate) {
+          setAvailableUpdateVersion(null);
+          setAvailableUpdateNotes(null);
+          setUpdateStatus("idle");
+          setUpdateMessage("You are up to date");
+          return;
+        }
+
+        pendingUpdateRef.current = nextUpdate;
+        setAvailableUpdateVersion(nextUpdate.version);
+        setAvailableUpdateNotes(nextUpdate.body ?? null);
+        setUpdateStatus("available");
+        setUpdateMessage(`Update ${nextUpdate.version} is ready to install`);
+      } catch (error) {
+        console.error("[Toolbar] Failed to check for updates:", error);
+        await clearPendingUpdate();
+        setAvailableUpdateVersion(null);
+        setAvailableUpdateNotes(null);
+
+        if (silent) {
+          setUpdateStatus("idle");
+          setUpdateMessage("Check for updates");
+          return;
+        }
+
+        setUpdateStatus("error");
+        setUpdateMessage(
+          error instanceof Error ? error.message : "Failed to check for updates",
+        );
+      }
+    },
+    [clearPendingUpdate],
+  );
+
+  const handleInstallUpdate = useCallback(async () => {
+    const pendingUpdate = pendingUpdateRef.current;
+    if (!pendingUpdate) {
+      await handleCheckForUpdates();
+      return;
+    }
+
+    let downloadedBytes = 0;
+    let contentLength = 0;
+
+    setDownloadProgress(0);
+    setUpdateStatus("downloading");
+    setUpdateMessage(`Downloading ${pendingUpdate.version}...`);
+
+    try {
+      await pendingUpdate.downloadAndInstall((event: AppUpdateDownloadEvent) => {
+        switch (event.event) {
+          case "Started":
+            contentLength = event.data.contentLength ?? 0;
+            setDownloadProgress(0);
+            break;
+          case "Progress":
+            downloadedBytes += event.data.chunkLength;
+            if (contentLength > 0) {
+              setDownloadProgress(
+                Math.min(100, Math.round((downloadedBytes / contentLength) * 100)),
+              );
+            }
+            break;
+          case "Finished":
+            setDownloadProgress(100);
+            break;
+        }
+      });
+
+      setUpdateStatus("restarting");
+      setUpdateMessage("Restarting to finish the update...");
+      await clearPendingUpdate();
+      await relaunchForUpdate();
+    } catch (error) {
+      console.error("[Toolbar] Failed to install update:", error);
+      setUpdateStatus("error");
+      setUpdateMessage(
+        error instanceof Error ? error.message : "Failed to install update",
+      );
+    }
+  }, [clearPendingUpdate, handleCheckForUpdates]);
+
+  useEffect(() => {
+    void handleCheckForUpdates(true);
+
+    return () => {
+      void clearPendingUpdate();
+    };
+  }, [clearPendingUpdate, handleCheckForUpdates]);
 
   const commitPageInput = () => {
     const val = parseInt(pageInput, 10);
@@ -84,6 +213,35 @@ export function Toolbar() {
       await addBookmark(currentPage);
     }
   };
+
+  const updateButtonTitle = availableUpdateNotes
+    ? `${updateMessage}\n\n${availableUpdateNotes}`
+    : updateMessage;
+
+  const updateDisabled =
+    updateStatus === "checking" ||
+    updateStatus === "downloading" ||
+    updateStatus === "restarting";
+
+  const showUpdateStatusChip =
+    updateStatus === "available" ||
+    updateStatus === "downloading" ||
+    updateStatus === "restarting" ||
+    updateStatus === "error";
+
+  let updateStatusLabel = "";
+  if (updateStatus === "available" && availableUpdateVersion) {
+    updateStatusLabel = `Update ${availableUpdateVersion}`;
+  } else if (updateStatus === "downloading") {
+    updateStatusLabel =
+      downloadProgress === null
+        ? "Downloading update"
+        : `Downloading ${downloadProgress}%`;
+  } else if (updateStatus === "restarting") {
+    updateStatusLabel = "Restarting...";
+  } else if (updateStatus === "error") {
+    updateStatusLabel = "Update failed";
+  }
 
   return (
     <div className="flex h-10 items-center gap-1 border-b bg-background px-2">
@@ -205,12 +363,57 @@ export function Toolbar() {
             <StickyNote size={16} />
           </button>
 
-          {/* Title */}
-          <div className="ml-2 flex-1 truncate text-sm text-muted-foreground">
+          <div className="ml-2 min-w-0 flex-1 truncate text-sm text-muted-foreground">
             {doc.title ?? "Untitled"}
           </div>
         </>
       )}
+
+      <div className="ml-auto flex items-center gap-2">
+        {showUpdateStatusChip && (
+          <button
+            className={cn(
+              "flex h-7 items-center gap-1 rounded-full border px-2 text-xs transition-colors",
+              updateStatus === "available" &&
+                "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/15 dark:text-emerald-300",
+              updateStatus === "downloading" &&
+                "border-primary/20 bg-primary/10 text-foreground",
+              updateStatus === "restarting" &&
+                "border-primary/20 bg-primary/10 text-foreground",
+              updateStatus === "error" &&
+                "border-destructive/20 bg-destructive/10 text-destructive",
+            )}
+            onClick={() => {
+              if (updateStatus === "available") {
+                void handleInstallUpdate();
+              } else if (updateStatus === "error") {
+                void handleCheckForUpdates();
+              }
+            }}
+            disabled={updateStatus !== "available" && updateStatus !== "error"}
+            title={updateButtonTitle}
+          >
+            {updateStatus === "available" && <Download size={12} />}
+            {(updateStatus === "downloading" || updateStatus === "restarting") && (
+              <LoaderCircle size={12} className="animate-spin" />
+            )}
+            {updateStatusLabel}
+          </button>
+        )}
+
+        <button
+          className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+          onClick={() => void handleCheckForUpdates()}
+          disabled={updateDisabled}
+          title={updateButtonTitle}
+        >
+          {updateStatus === "checking" ? (
+            <LoaderCircle size={16} className="animate-spin" />
+          ) : (
+            <RefreshCw size={16} />
+          )}
+        </button>
+      </div>
     </div>
   );
 }

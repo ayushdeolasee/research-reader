@@ -99,7 +99,7 @@ const MAX_STORED_MESSAGE_CHARS = 12_000;
 const MAX_STORED_DOCUMENTS = 25;
 
 const DEFAULT_SETTINGS: AiSettings = {
-  model: "gemini-3.1-flash-lite",
+  model: "gemini-3.1-flash-lite-preview",
   apiKey: "",
   voiceMode: "off",
   ttsEnabled: false,
